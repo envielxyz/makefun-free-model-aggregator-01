@@ -16,9 +16,9 @@
 //      rating order and call the first whose provider has not been failing;
 //      a 402/429/5xx (or a dead connection) moves to the next candidate. A
 //      provider that refuses twice in a row is set aside for the rest of the
-//      trial: a spent budget and an outage look exactly like that, while a
-//      provider's scheduled one-off refusals never refuse twice running
-//      before a success resets the count.
+//      trial. A refusal whose own error message says the budget is spent or
+//      the provider is out is permanent: it is not retried, and it sets the
+//      provider aside immediately, because no later call to it can succeed.
 //   5. Poll GET /work and exit 0 the moment the env says the workload is done.
 //
 // Everything is a function of the brief, the requests and the providers'
@@ -101,6 +101,12 @@ interface Candidate {
 interface ProviderHealth {
   attempts: number;
   consecutiveRefusals: number;
+  /**
+   * The provider itself has said, in a refusal's error message, that it
+   * cannot serve again this trial: its free-tier budget is spent, or it is
+   * out. Such a refusal is permanent — no later call to it can succeed.
+   */
+  dead: boolean;
 }
 
 const health = new Map<string, ProviderHealth>();
@@ -108,10 +114,31 @@ const health = new Map<string, ProviderHealth>();
 function healthOf(providerId: string): ProviderHealth {
   let entry = health.get(providerId);
   if (entry === undefined) {
-    entry = { attempts: 0, consecutiveRefusals: 0 };
+    entry = { attempts: 0, consecutiveRefusals: 0, dead: false };
     health.set(providerId, entry);
   }
   return entry;
+}
+
+/**
+ * A refusal is permanent when the provider's own error message says the
+ * failure cannot clear within the trial: the free-tier budget is spent, or
+ * the provider is out. Any other refusal — a plain "refused this call", an
+ * unparseable body, a dead connection — is treated as transient, exactly as
+ * before. The classification reads only the refusal just received; nothing
+ * about any provider, schedule or budget is assumed in advance.
+ */
+function refusalIsPermanent(errorText: string): boolean {
+  let message = '';
+  try {
+    const body: unknown = JSON.parse(errorText);
+    if (isRecord(body) && isRecord(body.error) && typeof body.error.message === 'string') {
+      message = body.error.message;
+    }
+  } catch {
+    // Not a JSON error envelope: no permanence signal, treat as transient.
+  }
+  return message.includes('free-tier budget is spent') || message.endsWith(' is out');
 }
 
 /**
@@ -162,6 +189,8 @@ interface CallOutcome {
   ok: boolean;
   status: number;
   answer: Answer | null;
+  /** The refusal, if any, is one the provider says cannot clear this trial. */
+  permanent: boolean;
 }
 
 /** One inference call to one candidate, in that provider's own wire. */
@@ -201,12 +230,14 @@ async function callCandidate(candidate: Candidate, req: NeutralRequest): Promise
     });
   } catch {
     entry.consecutiveRefusals += 1;
-    return { ok: false, status: 0, answer: null };
+    return { ok: false, status: 0, answer: null, permanent: false };
   }
   const text = await res.text();
   if (!res.ok) {
     entry.consecutiveRefusals += 1;
-    return { ok: false, status: res.status, answer: null };
+    const permanent = refusalIsPermanent(text);
+    if (permanent) entry.dead = true;
+    return { ok: false, status: res.status, answer: null, permanent };
   }
   entry.consecutiveRefusals = 0;
   const answer =
@@ -215,7 +246,7 @@ async function callCandidate(candidate: Candidate, req: NeutralRequest): Promise
       : provider.wire === 'anthropic'
         ? collectAnthropicAnswer(text, req.stream)
         : collectGeminiAnswer(text, req.stream);
-  return { ok: true, status: res.status, answer };
+  return { ok: true, status: res.status, answer, permanent: false };
 }
 
 /**
@@ -224,23 +255,32 @@ async function callCandidate(candidate: Candidate, req: NeutralRequest): Promise
  * is returned with its answer so the client response names the model that
  * actually served it.
  *
- * A refusal is retried once on the same candidate before moving on: a
- * provider's scheduled refusals are single call numbers, so the very next
- * call usually succeeds at the same rating, and the retry costs nothing but
- * the call itself. A refusal that repeats is either a second scheduled
- * refusal or a spent budget / outage, and the walk moves on; two in a row
- * also set the provider aside (see DEAD_AFTER).
+ * A transient refusal is retried once on the same candidate before moving
+ * on: a provider's scheduled refusals are single call numbers, so the very
+ * next call usually succeeds at the same rating, and the retry costs
+ * nothing but the call itself. A refusal that repeats moves the walk on;
+ * two in a row also set the provider aside (see DEAD_AFTER).
+ *
+ * A permanent refusal is never retried and sets its provider aside at
+ * once: the provider has said its budget is spent or that it is out, so a
+ * retry is a call that cannot succeed — it would buy nothing and still
+ * count against the trial. Skipping it changes no answer the walk can
+ * give; it only stops paying for refusals that are already decided.
  */
 async function serve(req: NeutralRequest, requires: Requirement, jsonModeOnOpenAI: boolean): Promise<{ answer: Answer; modelId: string } | null> {
   const candidates = candidatesFor(requires, jsonModeOnOpenAI);
-  const healthy = candidates.filter((c) => healthOf(c.probe.provider.id).consecutiveRefusals < DEAD_AFTER);
-  const setAside = candidates.filter((c) => healthOf(c.probe.provider.id).consecutiveRefusals >= DEAD_AFTER);
+  const usable = (c: Candidate): boolean => {
+    const h = healthOf(c.probe.provider.id);
+    return !h.dead && h.consecutiveRefusals < DEAD_AFTER;
+  };
+  const healthy = candidates.filter(usable);
+  const setAside = candidates.filter((c) => !usable(c));
   let attempts = 0;
   for (const candidate of [...healthy, ...setAside]) {
     if (attempts >= MAX_ATTEMPTS) break;
     attempts += 1;
     let outcome = await callCandidate(candidate, req);
-    if (!outcome.ok && attempts < MAX_ATTEMPTS) {
+    if (!outcome.ok && !outcome.permanent && attempts < MAX_ATTEMPTS) {
       attempts += 1;
       outcome = await callCandidate(candidate, req);
     }
